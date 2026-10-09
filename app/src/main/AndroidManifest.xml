@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Visibility of apps that have a launcher activity (Android 11+ package
+         visibility). Deliberately NOT QUERY_ALL_PACKAGES. -->
+    <!-- Show the system uninstall dialog from the app long-press menu. -->
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+
+    <!-- Opt-in widgets only (weather via Open-Meteo, BTC via Kraken) and the
+         tailnet check (your own tailnet host). Gantry stays fully functional
+         with the Network permission revoked. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Tailnet indicator: tells "Tailscale hung" (VPN up, internet fine,
+         tailnet host silent) apart from "no internet at all". Normal
+         permission, granted at install; reads network state only. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- See the private space profile while it is locked. Role-protected:
+         only granted while Gantry holds the default-launcher (HOME) role. -->
+    <uses-permission android:name="android.permission.ACCESS_HIDDEN_PROFILES" />
+
+    <!-- Optional: weather via device position (coarse only, user-granted,
+         rounded to ~1 km before any request leaves the device). -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- Optional: only to auto-arm read-aloud when connecting to a Bluetooth
+         device the user picked (e.g. their car). User-granted; nothing else
+         uses Bluetooth. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- Normal (auto-granted) permission gating the clock app's intent
+         handler: without it the clock widget's default tap (SHOW_ALARMS)
+         is rejected with a SecurityException instead of opening Clock. -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+
+    <queries>
+        <!-- Tailscale: see it's installed and reach its automation receiver
+             (connect / disconnect) to restart a hung tailnet. -->
+        <package android:name="com.tailscale.ipn" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <!-- See installed text-to-speech engines (read-aloud availability check
+             and binding), despite Android 11+ package visibility. -->
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <!-- Discover installed icon packs (resources-only theme APKs) by the
+             de-facto standard theme actions. Only packages that self-identify
+             as icon packs become visible; their code never runs. -->
+        <intent>
+            <action android:name="org.adw.launcher.THEMES" />
+        </intent>
+        <intent>
+            <action android:name="com.novalauncher.THEME" />
+        </intent>
+        <intent>
+            <action android:name="com.gau.go.launcherex.theme" />
+        </intent>
+        <intent>
+            <action android:name="com.anddoes.launcher.THEME" />
+        </intent>
+    </queries>
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.Gantry"
+        android:supportsRtl="true"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="portrait"
+            android:stateNotNeeded="true"
+            android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode"
+            android:resizeableActivity="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Confirms "Add to Home screen" pin requests from browsers and apps.
+             Its presence is what makes the system report pin-shortcut support
+             (and browsers show their install option) while Gantry is the
+             default launcher. Launched by the system; forged intents fail the
+             getPinItemRequest() validity check and finish immediately. -->
+        <activity
+            android:name=".PinShortcutActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@style/Theme.Gantry.Pin">
+            <intent-filter>
+                <action android:name="android.content.pm.action.CONFIRM_PIN_SHORTCUT" />
+            </intent-filter>
+        </activity>
+
+        <!-- Notification access: powers the media widget (active media
+             sessions), the home notification strip and list (titles, text,
+             actions, replies), app badges, and opt-in read-aloud. Content is
+             shown and optionally spoken on-device only; never stored or sent.
+             Not exported: only the system can bind it. -->
+        <service
+            android:name=".media.MediaNotificationListener"
+            android:exported="false"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

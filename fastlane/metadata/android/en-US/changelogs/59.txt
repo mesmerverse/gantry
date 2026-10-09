@@ -1,0 +1,6 @@
+First public release.
+
+- Airlock: contain tracking apps in Android private space
+- Home dashboard with clock, date, battery, weather, price ticker and media
+- Tags, alphabet-rail drawer, notification strip
+- Ten bundled open-license fonts

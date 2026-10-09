@@ -1,0 +1,15 @@
+<p>Gantry is a vertical, one-handed launcher with a glanceable dashboard and a feature the alternatives don't have: the <b>Airlock</b>. It repurposes Android's private space as a containment area for apps that track you. Your clean apps launch from the gantry as normal. Seal the airlock and the tracking apps inside are fully stopped. The rocket in the dock shows at a glance whether containment is open.</p>
+
+<p><b>Features</b></p>
+<ul>
+<li><b>Home dashboard</b>: date, weather, big clock, battery, price ticker, and a now-playing widget. Every component can be toggled, configured, and given a custom tap action.</li>
+<li><b>Airlock</b>: contained apps show amber rings and hatch glyphs everywhere. Tap a sealed app to unlock and launch it in one motion. Long-press the dock rocket to seal or open the airlock. Uninstalls target the right profile.</li>
+<li><b>Tags</b>: one organization model. Home and Dock are reserved tags, custom tags group and filter the drawer, and everything can be reordered by drag.</li>
+<li><b>Drawer</b>: alphabet rail with magnifier scrubbing, search where Enter launches the best match, notification dots and optional one-line previews.</li>
+<li><b>Appearance</b>: adaptive or custom text color, highlight color, ten bundled open-license fonts with live previews, a font-size slider, and a custom background image or solid color.</li>
+</ul>
+
+<p><b>Privacy</b></p>
+<p>Offline by default: no analytics, no Google dependencies. Weather (Open-Meteo), the price ticker (Kraken or any HTTPS JSON endpoint), media, and device location are each opt-in. Revoke the Network permission and Gantry keeps working.</p>
+
+<p>Gantry is built for GrapheneOS. Set it as your default home app so the Airlock features work, and grant notification access in Gantry's settings for the media widget and notification previews.</p>
