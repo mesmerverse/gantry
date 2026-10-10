@@ -10,6 +10,9 @@
 </ul>
 
 <p><b>Privacy</b></p>
-<p>Offline by default: no analytics, no Google dependencies. Weather (Open-Meteo), the price ticker (Kraken or any HTTPS JSON endpoint), media, and device location are each opt-in. Revoke the Network permission and Gantry keeps working.</p>
+<p>Offline by default: no analytics, no Google dependencies. A fresh install makes no network connections. Weather (Open-Meteo), the price ticker (Kraken or any HTTPS JSON endpoint), media, and device location are each opt-in. Revoke the Network permission and Gantry keeps working.</p>
+
+<p><b>VPN status</b></p>
+<p>A header icon shows which VPN app is connected (Tailscale, WireGuard, Proton VPN, Mullvad and others); tap it to connect or disconnect. Optionally, enter a host on your Tailscale tailnet and Gantry checks that it is still reachable: while Tailscale is the connected VPN it opens a TCP connection to that host and resolves example.com, every minute while the home screen is visible (every 5 minutes in the background if "Fix automatically" is on), and can restart a hung Tailscale. No host is set by default, so no check runs until you add one.</p>
 
 <p>Gantry is built for GrapheneOS. Set it as your default home app so the Airlock features work, and grant notification access in Gantry's settings for the media widget and notification previews.</p>

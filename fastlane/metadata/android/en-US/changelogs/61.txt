@@ -1,0 +1,2 @@
+- Tailscale health check is now opt-in: no check host is set by default, so a fresh install makes no network connections. If you used the check, enter your host again in Settings.
+- Appearance: the text color options no longer wrap mid-word.

@@ -26,10 +26,16 @@ a glance whether containment is open.
 - **Appearance** — adaptive/custom text color, highlight color, ten bundled
   OFL fonts with live previews, font-size slider, custom background image
   (with pan/zoom positioning) or solid color.
-- **Offline by default** — no analytics, no Google dependencies. Weather
-  (Open-Meteo), the price ticker (Kraken or any HTTPS JSON endpoint), media,
-  and device location are individually opt-in; revoke the Network permission
-  and Gantry keeps working.
+- **Offline by default** — no analytics, no Google dependencies; a fresh
+  install makes no network connections. Weather (Open-Meteo), the price
+  ticker (Kraken or any HTTPS JSON endpoint), media, and device location are
+  individually opt-in; revoke the Network permission and Gantry keeps working.
+- **VPN status** — a header icon shows which VPN app is connected; tap to
+  connect or disconnect. Optionally enter a host on your Tailscale tailnet
+  and Gantry checks it is still reachable (a TCP connection to that host plus
+  a lookup of `example.com`, every minute while the home screen is visible)
+  and can restart a hung Tailscale. No host is set by default, so nothing is
+  checked until you add one.
 
 ## Install
 

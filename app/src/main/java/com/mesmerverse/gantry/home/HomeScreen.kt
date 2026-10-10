@@ -2823,7 +2823,12 @@ private fun AppearanceSettings(viewModel: HomeViewModel, onAdjustBackground: () 
     // ----- Text -----
     SettingsGroupHeader("Text")
     OptionLabel("Color")
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    // Tighter spacing keeps all four on one line at the default size; at
+    // larger fonts a chip moves down whole instead of breaking mid-word.
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
         TextMode.entries.forEach { mode ->
             TagChip(
                 text = mode.name,
@@ -3439,10 +3444,11 @@ private fun TailnetConfig(viewModel: HomeViewModel) {
     if (vpns.none { it.first == TailnetMonitor.TAILSCALE }) return
     OptionLabel("Tailscale health check")
     Text(
-        text = "While Tailscale is the connected VPN, checks a machine that only " +
-            "answers over your tailnet, and that DNS resolves. If either fails, " +
-            "the icon turns your highlight colour; tap it to restart Tailscale. " +
-            "A highlighted top node means it was fixed in the last 5 minutes.",
+        text = "Optional, and off until you enter a host. While Tailscale is the " +
+            "connected VPN, checks a machine that only answers over your tailnet, " +
+            "and that DNS resolves. If either fails, the icon turns your highlight " +
+            "colour; tap it to restart Tailscale. A highlighted top node means it " +
+            "was fixed in the last 5 minutes.",
         style = MaterialTheme.typography.labelMedium,
         color = MaterialTheme.colorScheme.secondary,
         modifier = Modifier.padding(bottom = 8.dp),
@@ -5391,6 +5397,8 @@ private fun TagChip(
         text = text,
         style = MaterialTheme.typography.labelLarge,
         color = textColor,
+        maxLines = 1,
+        softWrap = false,
         modifier = Modifier
             .clip(PillShape)
             .background(background)

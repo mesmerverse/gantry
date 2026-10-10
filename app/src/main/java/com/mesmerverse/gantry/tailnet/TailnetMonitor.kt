@@ -63,7 +63,10 @@ data class TailnetState(
 )
 
 data class TailnetSettings(
-    /** A tailnet-only host that is always up (e.g. the headscale server). */
+    /**
+     * A tailnet-only host that is always up (e.g. the headscale server).
+     * Blank (the default) means no health check: nothing is contacted.
+     */
     val host: String = DEFAULT_HOST,
     val port: Int = DEFAULT_PORT,
     /** Restart Tailscale on its own when the tailnet hangs. */
@@ -82,9 +85,10 @@ data class TailnetSettings(
 
     companion object {
         const val LAST_USED = "last_used"
-        // Headscale hands out addresses from the bottom of its range, so its
-        // first node is the usual "always on" box.
-        const val DEFAULT_HOST = "100.64.0.1"
+        // No host until the user enters one: the health check is opt-in, so a
+        // fresh install makes no connections. (Headscale's first node,
+        // 100.64.0.1, is the usual "always on" box to point it at.)
+        const val DEFAULT_HOST = ""
         const val DEFAULT_PORT = 22
     }
 }
@@ -341,7 +345,9 @@ object TailnetMonitor {
             return 0
         }
         val status = when {
-            settings.host.isBlank() -> TailnetStatus.Healthy
+            // No check host set: report it like any other connected VPN
+            // rather than claiming a health we haven't measured.
+            settings.host.isBlank() -> TailnetStatus.Connected
             !underlyingInternet(connectivity) -> TailnetStatus.Offline
             probe(settings.host, settings.port) && dnsWorks() -> TailnetStatus.Healthy
             else -> {
