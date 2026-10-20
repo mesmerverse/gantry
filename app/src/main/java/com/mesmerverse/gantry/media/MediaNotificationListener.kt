@@ -35,6 +35,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -132,6 +133,7 @@ class MediaNotificationListener : NotificationListenerService() {
     override fun onDestroy() {
         btReceiver?.let { runCatching { unregisterReceiver(it) } }
         disarm()
+        if (!hasAccess()) notifications.value = emptyMap()
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -248,9 +250,19 @@ class MediaNotificationListener : NotificationListenerService() {
 
     override fun onListenerDisconnected() {
         if (instance === this) instance = null
-        // Don't blank on a transient disconnect; ask to rebind to recover.
+        // Access revoked: what was received is no longer current; clear it.
+        // Otherwise don't blank on a transient disconnect; ask to rebind.
+        if (!hasAccess()) {
+            notifications.value = emptyMap()
+            return
+        }
         runCatching { requestRebind(ComponentName(this, MediaNotificationListener::class.java)) }
     }
+
+    private fun hasAccess(): Boolean = runCatching {
+        getSystemService(android.app.NotificationManager::class.java)
+            .isNotificationListenerAccessGranted(ComponentName(this, MediaNotificationListener::class.java))
+    }.getOrDefault(false)
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         maybeReadAloud(sbn)
@@ -307,7 +319,12 @@ class MediaNotificationListener : NotificationListenerService() {
             title.isNotBlank() && text.isNotBlank() -> "$title. $text"
             else -> title.ifBlank { text }
         }
-        speak(spoken, sbn.key + hash)
+        // The system plays the notification's sound as it posts; let that
+        // short chime finish so it doesn't land on top of the first words.
+        serviceScope.launch {
+            delay(CHIME_GAP_MS)
+            if (armed) speak(spoken, sbn.key + hash)
+        }
     }
 
     private fun appLabel(pkg: String): String = runCatching {
@@ -494,6 +511,9 @@ class MediaNotificationListener : NotificationListenerService() {
         var instance: MediaNotificationListener? = null
 
         private const val TAG = "GantryReadAloud"
+
+        /** Wait after a post before speaking, past a typical notification chime. */
+        private const val CHIME_GAP_MS = 1_500L
 
         private val DISCONNECT_WORDS =
             Regex("disconnect|stop|turn off|pause|quit", RegexOption.IGNORE_CASE)

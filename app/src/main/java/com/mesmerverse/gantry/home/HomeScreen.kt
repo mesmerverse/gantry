@@ -254,7 +254,15 @@ fun HomeScreen(
     val weather by viewModel.weather.collectAsStateWithLifecycle()
     val btc by viewModel.btc.collectAsStateWithLifecycle()
     val media by viewModel.media.collectAsStateWithLifecycle()
-    val notifications by viewModel.notifications.collectAsStateWithLifecycle()
+    val liveNotifications by viewModel.notifications.collectAsStateWithLifecycle()
+    // Revoking notification access stops updates but leaves the last snapshot
+    // behind; don't show it as current once access is gone.
+    val accessContext = LocalContext.current
+    val notificationAccess by rememberRefreshedOnResume {
+        NotificationManagerCompat.getEnabledListenerPackages(accessContext)
+            .contains(accessContext.packageName)
+    }
+    val notifications = if (notificationAccess) liveNotifications else emptyMap()
     fun badgeCount(app: AppEntry): Int = notifications[app.notificationKey()]?.count ?: 0
     // Resolves a notification's "userHash/package" key to its app, if listed.
     fun notifApp(pkgKey: String): AppEntry? =
@@ -293,7 +301,6 @@ fun HomeScreen(
         if (key == null || !viewModel.launchAppByKey(key)) default()
     }
 
-    // Settings closes before the drawer (composed later => higher priority).
     BackHandler(enabled = showSettings) { showSettings = false }
 
     // Guided tour: self-starts on first run, replayable from Settings.
@@ -347,7 +354,9 @@ fun HomeScreen(
     var folderMenuFor by remember { mutableStateOf<String?>(null) }
     var reorderFolderFor by remember { mutableStateOf<String?>(null) }
     var renameFolderFor by remember { mutableStateOf<String?>(null) }
-    BackHandler(enabled = drawerOpen) { drawerOpen = false }
+    // Settings can open over the drawer; it must close first. This handler is
+    // composed later, so it would otherwise win.
+    BackHandler(enabled = drawerOpen && !showSettings) { drawerOpen = false }
 
     // Subtle scrim so text stays legible on busy wallpapers, matched to the
     // adaptive text color (dark text -> light scrim, light text -> dark scrim).
@@ -1015,6 +1024,7 @@ fun HomeScreen(
             title = "Rename folder",
             initialName = oldName,
             confirmLabel = "Rename",
+            takenNames = tags.map { it.name } + TagsRepository.RESERVED,
             onConfirm = { newName ->
                 viewModel.renameTag(oldName, newName)
                 renameFolderFor = null
@@ -5063,6 +5073,7 @@ private fun AppDrawer(
             title = "Rename tag",
             initialName = oldName,
             confirmLabel = "Rename",
+            takenNames = tags.map { it.name } + TagsRepository.RESERVED,
             onConfirm = { newName ->
                 onRenameTag(oldName, newName)
                 if (selectedTag == oldName) selectedTag = newName.trim()
@@ -5794,8 +5805,15 @@ private fun TagNameDialog(
     confirmLabel: String,
     onConfirm: (String) -> Unit,
     onDismiss: () -> Unit,
+    // Names a rename may not take (the repository would silently refuse
+    // them); the dialog says so instead of closing on a no-op.
+    takenNames: Collection<String> = emptyList(),
 ) {
     var name by remember { mutableStateOf(initialName) }
+    val trimmed = name.trim()
+    val taken = takenNames.firstOrNull {
+        it.equals(trimmed, ignoreCase = true) && !it.equals(initialName, ignoreCase = true)
+    }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
@@ -5805,11 +5823,14 @@ private fun TagNameDialog(
                 onValueChange = { name = it },
                 singleLine = true,
                 label = { Text("Name") },
+                isError = taken != null,
+                supportingText = taken?.let { { Text("“$it” is already taken") } },
             )
         },
         confirmButton = {
             TextButton(
-                onClick = { if (name.isNotBlank()) onConfirm(name) },
+                onClick = { if (trimmed.isNotEmpty() && taken == null) onConfirm(name) },
+                enabled = trimmed.isNotEmpty() && taken == null,
             ) { Text(confirmLabel) }
         },
         dismissButton = {

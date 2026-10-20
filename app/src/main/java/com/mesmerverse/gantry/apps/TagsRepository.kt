@@ -195,6 +195,6 @@ class TagsRepository(private val context: Context) {
 
         /** The lone critical-app shortcut beside the dock. */
         const val CORNER = "Corner"
-        private val RESERVED = listOf(HOME, DOCK, CORNER)
+        val RESERVED = listOf(HOME, DOCK, CORNER)
     }
 }
