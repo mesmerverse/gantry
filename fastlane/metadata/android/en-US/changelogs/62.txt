@@ -1,0 +1,4 @@
+- Renaming a tag or folder to a name already in use (including Home, Dock and Corner) now says so instead of silently doing nothing.
+- Notifications are hidden once notification access is turned off, instead of showing the last ones received.
+- Back from Settings opened over the app drawer now closes Settings first.
+- Read-aloud waits for the notification chime to finish before speaking.
