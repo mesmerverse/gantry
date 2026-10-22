@@ -18,6 +18,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.app.RemoteInput
 import android.media.AudioAttributes
+import android.media.AudioManager
 import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
@@ -319,13 +320,50 @@ class MediaNotificationListener : NotificationListenerService() {
             title.isNotBlank() && text.isNotBlank() -> "$title. $text"
             else -> title.ifBlank { text }
         }
-        // The system plays the notification's sound as it posts; let that
-        // short chime finish so it doesn't land on top of the first words.
+        // The system plays the notification's sound just after it posts; let
+        // that sound finish so it doesn't land on top of the first words.
         serviceScope.launch {
-            delay(CHIME_GAP_MS)
+            awaitNotificationSound()
             if (armed) speak(spoken, sbn.key + hash)
         }
     }
+
+    /**
+     * Waits out the notification sound the system plays for a fresh post:
+     * gives it [SOUND_START_WAIT_MS] to start, then waits until it has
+     * finished (its player is released), capped at [SOUND_MAX_WAIT_MS] so a
+     * long or looping sound can't hold speech back for good. A silent post
+     * costs only the start wait.
+     */
+    private suspend fun awaitNotificationSound() {
+        val audio = getSystemService(AudioManager::class.java) ?: run {
+            delay(CHIME_GAP_MS)
+            return
+        }
+        // Players already around before this post (another app's idle one,
+        // say) don't count; only one beyond them is this post's sound.
+        val baseline = notificationPlayers(audio)
+        var waited = 0L
+        var started = false
+        while (waited < SOUND_MAX_WAIT_MS) {
+            delay(SOUND_POLL_MS)
+            waited += SOUND_POLL_MS
+            val playing = notificationPlayers(audio) > baseline
+            if (playing) started = true
+            if (started && !playing) break
+            if (!started && waited >= SOUND_START_WAIT_MS) break
+        }
+        debug("chime wait started=$started waited=${waited}ms")
+        // The tail of the sound may still be in flight to Bluetooth headphones.
+        if (started) delay(SOUND_TAIL_MS)
+    }
+
+    private fun notificationPlayers(audio: AudioManager): Int = runCatching {
+        audio.activePlaybackConfigurations.count {
+            it.audioAttributes.usage == AudioAttributes.USAGE_NOTIFICATION ||
+                it.audioAttributes.usage == AudioAttributes.USAGE_NOTIFICATION_EVENT
+        }
+    }.getOrDefault(0)
 
     private fun appLabel(pkg: String): String = runCatching {
         packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
@@ -512,8 +550,15 @@ class MediaNotificationListener : NotificationListenerService() {
 
         private const val TAG = "GantryReadAloud"
 
-        /** Wait after a post before speaking, past a typical notification chime. */
+        /** Fixed wait after a post when the audio service isn't available. */
         private const val CHIME_GAP_MS = 1_500L
+
+        // Waiting out a post's notification sound: how long it gets to start,
+        // the overall cap, polling interval, and a margin for output latency.
+        private const val SOUND_START_WAIT_MS = 1_000L
+        private const val SOUND_MAX_WAIT_MS = 10_000L
+        private const val SOUND_POLL_MS = 100L
+        private const val SOUND_TAIL_MS = 300L
 
         private val DISCONNECT_WORDS =
             Regex("disconnect|stop|turn off|pause|quit", RegexOption.IGNORE_CASE)
