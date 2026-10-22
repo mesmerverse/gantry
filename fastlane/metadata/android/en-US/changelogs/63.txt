@@ -1,0 +1,1 @@
+- Read-aloud now waits until the notification sound has finished playing, so longer sounds no longer overlap the start of speech.

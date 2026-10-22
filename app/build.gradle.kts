@@ -26,8 +26,8 @@ android {
         applicationId = "com.mesmerverse.gantry"
         minSdk = 34
         targetSdk = 36
-        versionCode = 62
-        versionName = "1.25.3"
+        versionCode = 63
+        versionName = "1.25.4"
     }
 
     if (!signingProperties.isEmpty) {
