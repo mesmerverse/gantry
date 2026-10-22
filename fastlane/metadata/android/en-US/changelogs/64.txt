@@ -1,0 +1,2 @@
+- Read-aloud speaks notifications that arrive close together in the order they came, after all their sounds have finished.
+- Turning read-aloud off now also drops messages waiting to be spoken.
