@@ -19,7 +19,9 @@ import android.content.IntentFilter
 import android.app.RemoteInput
 import android.media.AudioAttributes
 import android.media.AudioManager
+import android.media.AudioPlaybackConfiguration
 import android.os.Bundle
+import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.speech.tts.TextToSpeech
@@ -34,6 +36,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -101,6 +104,24 @@ class MediaNotificationListener : NotificationListenerService() {
     private val spokenHashes = HashMap<String, Int>()
     // Messages that arrived before the engine finished initializing.
     private val pending = ArrayDeque<Pair<String, String>>()
+    // Messages waiting for notification sounds to finish, spoken in post
+    // order by the one [speechJob] that drains them.
+    // [redacted] is what a locked phone says instead, when the app didn't
+    // mark the notification public; chosen when it's spoken, not posted.
+    private class QueuedSpeech(
+        val full: String,
+        val redacted: String?,
+        val id: String,
+        val postedAt: Long,
+    )
+    private val speechQueue = ArrayDeque<QueuedSpeech>()
+    private var speechJob: Job? = null
+    // Notification-sound players seen while waiting, with when first seen. One
+    // older than [SOUND_MAX_WAIT_MS] no longer counts as a chime (another
+    // app's idle player, or a looping sound). A list matched with equals():
+    // the config's hashCode also covers its routing and mute state.
+    private class SeenSound(val config: AudioPlaybackConfiguration, val firstSeen: Long)
+    private val seenSounds = ArrayList<SeenSound>()
 
     override fun onCreate() {
         super.onCreate()
@@ -255,6 +276,7 @@ class MediaNotificationListener : NotificationListenerService() {
         // Otherwise don't blank on a transient disconnect; ask to rebind.
         if (!hasAccess()) {
             notifications.value = emptyMap()
+            clearSpeechQueue()
             return
         }
         runCatching { requestRebind(ComponentName(this, MediaNotificationListener::class.java)) }
@@ -296,74 +318,103 @@ class MediaNotificationListener : NotificationListenerService() {
             notification.category != Notification.CATEGORY_MESSAGE
         ) return
 
-        // Locked phone, no car connected: honour lock-screen privacy — speak
-        // the app's public version, else just which app it is, never the
-        // private content out of the phone's own speaker.
-        val locked = getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
-        val redact = locked && connectedAutoArm.isEmpty() &&
-            notification.visibility != Notification.VISIBILITY_PUBLIC
-        val source = if (redact) notification.publicVersion else notification
-        val extras = source?.extras
-        var title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
-        var text = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
-        if (redact && title.isBlank() && text.isBlank()) {
-            title = "New notification from ${appLabel(sbn.packageName)}"
-            text = ""
-        }
-        if (title.isBlank() && text.isBlank()) return
-
-        val hash = "$title|$text".hashCode()
+        val full = spokenText(notification) ?: return
+        val hash = full.hashCode()
         if (spokenHashes[sbn.key] == hash) return
         spokenHashes[sbn.key] = hash
 
-        val spoken = when {
-            title.isNotBlank() && text.isNotBlank() -> "$title. $text"
-            else -> title.ifBlank { text }
+        // Locked phone, no car connected: honour lock-screen privacy — speak
+        // the app's public version, else just which app it is, never the
+        // private content out of the phone's own speaker.
+        val redacted = if (notification.visibility != Notification.VISIBILITY_PUBLIC) {
+            notification.publicVersion?.let(::spokenText)
+                ?: "New notification from ${appLabel(sbn.packageName)}"
+        } else null
+
+        // The system plays the notification's sound just after it posts; queue
+        // the message so it's spoken once that sound (and any from posts right
+        // behind it) has finished, in the order the posts arrived.
+        speechQueue.addLast(QueuedSpeech(full, redacted, sbn.key + hash, SystemClock.elapsedRealtime()))
+        if (speechJob?.isActive != true) {
+            speechJob = serviceScope.launch {
+                while (speechQueue.isNotEmpty()) {
+                    awaitNotificationSounds()
+                    val next = speechQueue.removeFirstOrNull() ?: break
+                    val locked = getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
+                    val text = next.redacted?.takeIf { locked && connectedAutoArm.isEmpty() } ?: next.full
+                    if (armed) speak(text, next.id)
+                }
+            }
         }
-        // The system plays the notification's sound just after it posts; let
-        // that sound finish so it doesn't land on top of the first words.
-        serviceScope.launch {
-            awaitNotificationSound()
-            if (armed) speak(spoken, sbn.key + hash)
+    }
+
+    /** "Title. Text" from a notification's extras, or null when both are blank. */
+    private fun spokenText(notification: Notification): String? {
+        val extras = notification.extras
+        val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
+        val text = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
+        return when {
+            title.isNotBlank() && text.isNotBlank() -> "$title. $text"
+            else -> title.ifBlank { text }.ifBlank { null }
         }
     }
 
     /**
-     * Waits out the notification sound the system plays for a fresh post:
-     * gives it [SOUND_START_WAIT_MS] to start, then waits until it has
-     * finished (its player is released), capped at [SOUND_MAX_WAIT_MS] so a
-     * long or looping sound can't hold speech back for good. A silent post
-     * costs only the start wait.
+     * Waits until notification sounds have gone quiet for the queued posts:
+     * the newest post's sound gets [SOUND_START_WAIT_MS] to start, and speech
+     * waits until no sound has played for [SOUND_TAIL_MS] (output latency,
+     * e.g. Bluetooth). Capped at [SOUND_MAX_WAIT_MS] so a stream of posts
+     * can't hold speech back for good. A silent post costs only the start wait.
      */
-    private suspend fun awaitNotificationSound() {
+    private suspend fun awaitNotificationSounds() {
         val audio = getSystemService(AudioManager::class.java) ?: run {
             delay(CHIME_GAP_MS)
             return
         }
-        // Players already around before this post (another app's idle one,
-        // say) don't count; only one beyond them is this post's sound.
-        val baseline = notificationPlayers(audio)
-        var waited = 0L
-        var started = false
-        while (waited < SOUND_MAX_WAIT_MS) {
+        val begin = SystemClock.elapsedRealtime()
+        var lastSound = 0L
+        var newestSound = 0L
+        var firstPoll = true
+        while (true) {
+            val now = SystemClock.elapsedRealtime()
+            if (now - begin >= SOUND_MAX_WAIT_MS) break
+            val newest = speechQueue.lastOrNull()?.postedAt ?: return
+            notificationSoundStart(audio, now, firstPoll)?.let {
+                lastSound = now
+                newestSound = maxOf(newestSound, it)
+            }
+            firstPoll = false
+            val quiet = now - lastSound >= SOUND_TAIL_MS
+            // Only a player that appeared after the newest post is its sound;
+            // one still playing from an earlier post doesn't count.
+            val awaitingStart = newestSound < newest && now - newest < SOUND_START_WAIT_MS
+            if (quiet && !awaitingStart) break
             delay(SOUND_POLL_MS)
-            waited += SOUND_POLL_MS
-            val playing = notificationPlayers(audio) > baseline
-            if (playing) started = true
-            if (started && !playing) break
-            if (!started && waited >= SOUND_START_WAIT_MS) break
         }
-        debug("chime wait started=$started waited=${waited}ms")
-        // The tail of the sound may still be in flight to Bluetooth headphones.
-        if (started) delay(SOUND_TAIL_MS)
+        debug("chime wait ${SystemClock.elapsedRealtime() - begin}ms queued=${speechQueue.size}")
     }
 
-    private fun notificationPlayers(audio: AudioManager): Int = runCatching {
-        audio.activePlaybackConfigurations.count {
-            it.audioAttributes.usage == AudioAttributes.USAGE_NOTIFICATION ||
-                it.audioAttributes.usage == AudioAttributes.USAGE_NOTIFICATION_EVENT
-        }
-    }.getOrDefault(0)
+    /**
+     * When the newest notification sound now playing was first seen, or null
+     * if none is. Players already there on a wait's [firstPoll] predate the
+     * post, so they count for at most [SOUND_PREEXISTING_MS] — enough for a
+     * chime in progress, without an idle player costing the full cap.
+     */
+    private fun notificationSoundStart(audio: AudioManager, now: Long, firstPoll: Boolean): Long? {
+        val players = runCatching {
+            audio.activePlaybackConfigurations.filter {
+                it.audioAttributes.usage == AudioAttributes.USAGE_NOTIFICATION ||
+                    it.audioAttributes.usage == AudioAttributes.USAGE_NOTIFICATION_EVENT
+            }
+        }.getOrDefault(emptyList())
+        seenSounds.removeAll { seen -> players.none { it == seen.config } }
+        val unseenAt = if (firstPoll) now - SOUND_MAX_WAIT_MS + SOUND_PREEXISTING_MS else now
+        return players.mapNotNull { config ->
+            val seen = seenSounds.firstOrNull { it.config == config }
+                ?: SeenSound(config, unseenAt).also { seenSounds += it }
+            seen.firstSeen.takeIf { now - it < SOUND_MAX_WAIT_MS }
+        }.maxOrNull()
+    }
 
     private fun appLabel(pkg: String): String = runCatching {
         packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
@@ -407,6 +458,7 @@ class MediaNotificationListener : NotificationListenerService() {
     /** Stop and release the engine; a fresh trip re-reads new arrivals. */
     private fun disarm() {
         pending.clear()
+        clearSpeechQueue()
         spokenHashes.clear()
         ttsReady = false
         tts?.let {
@@ -414,6 +466,12 @@ class MediaNotificationListener : NotificationListenerService() {
             runCatching { it.shutdown() }
         }
         tts = null
+    }
+
+    private fun clearSpeechQueue() {
+        speechQueue.clear()
+        speechJob?.cancel()
+        speechJob = null
     }
 
     /** Dismiss one notification by key (clears it from the shade too). */
@@ -553,11 +611,12 @@ class MediaNotificationListener : NotificationListenerService() {
         /** Fixed wait after a post when the audio service isn't available. */
         private const val CHIME_GAP_MS = 1_500L
 
-        // Waiting out a post's notification sound: how long it gets to start,
-        // the overall cap, polling interval, and a margin for output latency.
+        // Waiting out notification sounds: how long a post's sound gets to
+        // start, the overall cap, polling interval, and the quiet gap needed.
         private const val SOUND_START_WAIT_MS = 1_000L
         private const val SOUND_MAX_WAIT_MS = 10_000L
         private const val SOUND_POLL_MS = 100L
+        private const val SOUND_PREEXISTING_MS = 5_000L
         private const val SOUND_TAIL_MS = 300L
 
         private val DISCONNECT_WORDS =
