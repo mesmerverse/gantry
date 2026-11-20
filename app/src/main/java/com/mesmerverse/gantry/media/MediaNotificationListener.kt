@@ -21,10 +21,12 @@ import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
 import android.os.Bundle
+import android.os.PowerManager
 import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.mesmerverse.gantry.tailnet.TailnetMonitor
@@ -34,6 +36,7 @@ import com.mesmerverse.gantry.settings.WidgetSettingsRepository
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -42,6 +45,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.ConcurrentHashMap
 
 /** A notification action button (e.g. Reply, Mark as read). */
 data class NotifAction(val index: Int, val title: String, val isReply: Boolean)
@@ -85,7 +90,14 @@ class MediaNotificationListener : NotificationListenerService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var settings: SettingsRepository
     private var tts: TextToSpeech? = null
-    private var ttsReady = false
+    // Completes with whether the engine initialized; null until one is made.
+    private var ttsInit: CompletableDeferred<Boolean>? = null
+    // Utterance id -> completes when the engine finishes, stops or fails it.
+    // Completed from the engine's binder thread, hence concurrent.
+    private val utteranceDone = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
+    private var utteranceSeq = 0L
+    // Key of the notification being spoken right now, if any.
+    private var speakingKey: String? = null
     private var armed = false
     private var scope = ReadAloudScope.MessagesOnly
     // Effective arming = the read-aloud flag AND the widget being enabled (its
@@ -102,18 +114,11 @@ class MediaNotificationListener : NotificationListenerService() {
     // key -> hash of the last content spoken, so a conversation's new message
     // (same key, new text) reads but identical reposts don't.
     private val spokenHashes = HashMap<String, Int>()
-    // Messages that arrived before the engine finished initializing.
-    private val pending = ArrayDeque<Pair<String, String>>()
-    // Messages waiting for notification sounds to finish, spoken in post
-    // order by the one [speechJob] that drains them.
-    // [redacted] is what a locked phone says instead, when the app didn't
-    // mark the notification public; chosen when it's spoken, not posted.
-    private class QueuedSpeech(
-        val full: String,
-        val redacted: String?,
-        val id: String,
-        val postedAt: Long,
-    )
+    // Notifications waiting to be spoken, in post order, drained one at a
+    // time by [speechJob]. Only the key is kept: what's said (and whether
+    // it's said at all) is decided from the live notification, the current
+    // scope and the lock state at the moment it's spoken, not when posted.
+    private class QueuedSpeech(val key: String, val postedAt: Long)
     private val speechQueue = ArrayDeque<QueuedSpeech>()
     private var speechJob: Job? = null
     // Notification-sound players seen while waiting, with when first seen. One
@@ -293,7 +298,15 @@ class MediaNotificationListener : NotificationListenerService() {
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
-        sbn?.key?.let { spokenHashes.remove(it) }
+        sbn?.key?.let { key ->
+            spokenHashes.remove(key)
+            // Withdrawn before its turn: don't announce it (#6).
+            if (speechQueue.removeAll { it.key == key }) debug("dequeued: removed")
+            if (key == speakingKey) {
+                debug("stopped: removed while speaking")
+                runCatching { tts?.stop() }
+            }
+        }
         publish()
     }
 
@@ -305,46 +318,82 @@ class MediaNotificationListener : NotificationListenerService() {
      */
     private fun maybeReadAloud(sbn: StatusBarNotification?) {
         if (!armed) return
-        val notification = sbn?.notification ?: return
-        if (sbn.packageName == packageName) return
-        if (!sbn.isClearable) return
-        if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
-        // Never speak a notification the app marked sensitive (OTP/2FA, banking)
-        // aloud — it may be overheard, e.g. over car Bluetooth with passengers.
-        if (notification.visibility == Notification.VISIBILITY_SECRET) return
-        // The airlock's notifications stay in the airlock: never spoken.
-        if (sbn.user != Process.myUserHandle()) return
-        if (scope == ReadAloudScope.MessagesOnly &&
-            notification.category != Notification.CATEGORY_MESSAGE
-        ) return
-
-        val full = spokenText(notification) ?: return
+        if (sbn == null || !speakable(sbn)) return
+        val full = spokenText(sbn.notification) ?: return
         val hash = full.hashCode()
         if (spokenHashes[sbn.key] == hash) return
         spokenHashes[sbn.key] = hash
 
-        // Locked phone, no car connected: honour lock-screen privacy — speak
-        // the app's public version, else just which app it is, never the
-        // private content out of the phone's own speaker.
-        val redacted = if (notification.visibility != Notification.VISIBILITY_PUBLIC) {
-            notification.publicVersion?.let(::spokenText)
-                ?: "New notification from ${appLabel(sbn.packageName)}"
-        } else null
-
-        // The system plays the notification's sound just after it posts; queue
-        // the message so it's spoken once that sound (and any from posts right
-        // behind it) has finished, in the order the posts arrived.
-        speechQueue.addLast(QueuedSpeech(full, redacted, sbn.key + hash, SystemClock.elapsedRealtime()))
+        // An update to a notification still waiting replaces its entry, so
+        // superseded text is never spoken (#7). The system plays the sound
+        // just after a post; the drain waits that (and any sound from posts
+        // right behind it) out, then speaks in the order posts arrived.
+        if (speechQueue.removeAll { it.key == sbn.key }) debug("dequeued: superseded")
+        speechQueue.addLast(QueuedSpeech(sbn.key, SystemClock.elapsedRealtime()))
         if (speechJob?.isActive != true) {
-            speechJob = serviceScope.launch {
-                while (speechQueue.isNotEmpty()) {
-                    awaitNotificationSounds()
-                    val next = speechQueue.removeFirstOrNull() ?: break
-                    val locked = getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
-                    val text = next.redacted?.takeIf { locked && connectedAutoArm.isEmpty() } ?: next.full
-                    if (armed) speak(text, next.id)
-                }
-            }
+            speechJob = serviceScope.launch { drainSpeechQueue() }
+        }
+    }
+
+    /**
+     * Whether [sbn] may be spoken under the current settings. Checked on
+     * arrival and again just before speaking, so a scope change applies to
+     * what's already waiting (#8).
+     */
+    private fun speakable(sbn: StatusBarNotification): Boolean {
+        val notification = sbn.notification ?: return false
+        if (sbn.packageName == packageName) return false
+        if (!sbn.isClearable) return false
+        if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) return false
+        // Never speak a notification the app marked sensitive (OTP/2FA, banking)
+        // aloud — it may be overheard, e.g. over car Bluetooth with passengers.
+        if (notification.visibility == Notification.VISIBILITY_SECRET) return false
+        // The airlock's notifications stay in the airlock: never spoken.
+        if (sbn.user != Process.myUserHandle()) return false
+        if (scope == ReadAloudScope.MessagesOnly &&
+            notification.category != Notification.CATEGORY_MESSAGE
+        ) return false
+        return true
+    }
+
+    /**
+     * Speaks the queue one utterance at a time. Each entry is re-read from
+     * the live notification when its turn comes: gone means skipped (#6), its
+     * current text is what's said (#7), and [speakable] runs again (#8). The
+     * lock check happens right before each utterance and the next waits for
+     * it to finish, so a private message queued behind a long one is still
+     * redacted if the phone locks meanwhile (#9).
+     */
+    private suspend fun drainSpeechQueue() {
+        while (speechQueue.isNotEmpty()) {
+            awaitNotificationSounds()
+            if (speechQueue.isEmpty()) break
+            // Engine first: everything below is decided immediately before
+            // speaking, never before a wait.
+            val engine = awaitEngine()
+            val next = speechQueue.removeFirstOrNull() ?: break
+            if (!armed) break
+            if (engine == null) { debug("skip: no speech engine"); continue }
+            val live = runCatching { getActiveNotifications(arrayOf(next.key)) }
+                .getOrNull()?.firstOrNull { it.key == next.key }
+            if (live == null) { debug("skip: no longer posted"); continue }
+            if (!speakable(live)) { debug("skip: no longer speakable"); continue }
+            val full = spokenText(live.notification) ?: continue
+            spokenHashes[live.key] = full.hashCode()
+            // Locked (or screen off, which may not have locked yet), no car
+            // connected: honour lock-screen privacy — speak the app's public
+            // version, else just which app it is, never the private content
+            // out of the phone's own speaker.
+            val locked = getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true ||
+                getSystemService(PowerManager::class.java)?.isInteractive == false
+            val text = if (locked && connectedAutoArm.isEmpty() &&
+                live.notification.visibility != Notification.VISIBILITY_PUBLIC
+            ) {
+                live.notification.publicVersion?.let(::spokenText)
+                    ?: "New notification from ${appLabel(live.packageName)}"
+            } else full
+            debug("speak locked=$locked redacted=${text !== full} queued=${speechQueue.size}")
+            speakAndWait(engine, live.key, text)
         }
     }
 
@@ -420,56 +469,113 @@ class MediaNotificationListener : NotificationListenerService() {
         packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
     }.getOrDefault("an app")
 
-    private fun ensureTts() {
-        if (tts != null) return
-        tts = TextToSpeech(this) { status ->
-            ttsReady = status == TextToSpeech.SUCCESS
-            debug("tts init status=$status ready=$ttsReady pending=${pending.size}")
-            if (ttsReady) {
+    /** Creates the engine if needed; the result completes once it's usable (or not). */
+    private fun ensureTts(): CompletableDeferred<Boolean> {
+        ttsInit?.let { if (tts != null) return it }
+        val init = CompletableDeferred<Boolean>()
+        ttsInit = init
+        // The callback can run inside the constructor when no engine exists.
+        lateinit var engine: TextToSpeech
+        engine = TextToSpeech(this) { status ->
+            val ok = status == TextToSpeech.SUCCESS
+            debug("tts init status=$status ok=$ok")
+            if (ok) {
                 // Assistant usage ducks music and routes to the active output
                 // (e.g. the car's Bluetooth) instead of fighting it.
-                tts?.setAudioAttributes(
+                engine.setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_ASSISTANT)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
-                while (pending.isNotEmpty()) {
-                    val (t, id) = pending.removeFirst()
-                    tts?.speak(t, TextToSpeech.QUEUE_ADD, null, id)
-                }
-            } else {
-                pending.clear()
+                engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {}
+                    override fun onDone(utteranceId: String?) = finished(utteranceId)
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) = finished(utteranceId)
+                    override fun onError(utteranceId: String?, errorCode: Int) = finished(utteranceId)
+                    override fun onStop(utteranceId: String?, interrupted: Boolean) = finished(utteranceId)
+                })
             }
+            init.complete(ok)
         }
+        tts = engine
+        return init
     }
 
-    private fun speak(text: String, utteranceId: String) {
-        val engine = tts
-        if (engine == null || !ttsReady) {
-            // Engine still initializing — read it as soon as it's ready.
-            pending.addLast(text to utteranceId)
-            ensureTts()
+    private fun finished(utteranceId: String?) {
+        utteranceId?.let { utteranceDone.remove(it)?.complete(Unit) }
+    }
+
+    /**
+     * A ready engine, creating one if needed; null if it failed or didn't
+     * initialize in time, in which case it's dropped so the next message
+     * starts a fresh one.
+     */
+    private suspend fun awaitEngine(): TextToSpeech? {
+        val init = ensureTts()
+        val ok = withTimeoutOrNull(TTS_INIT_TIMEOUT_MS) { init.await() } ?: false
+        if (ok) tts?.let { return it }
+        if (ttsInit === init) releaseTts()
+        return null
+    }
+
+    /**
+     * Speaks [text] and suspends until the engine has finished it, so the
+     * next queued message is only chosen (and redacted) once this one is
+     * done. QUEUE_FLUSH (this app's queue only) so the engine never holds
+     * text decided earlier. An engine that refuses the text or never reports
+     * completion is presumed dead and released, so the next message gets a
+     * fresh one.
+     */
+    private suspend fun speakAndWait(engine: TextToSpeech, key: String, text: String) {
+        val id = "gantry-${utteranceSeq++}"
+        val done = CompletableDeferred<Unit>()
+        utteranceDone[id] = done
+        val queued = runCatching { engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, id) }
+            .getOrDefault(TextToSpeech.ERROR)
+        if (queued != TextToSpeech.SUCCESS) {
+            utteranceDone.remove(id)
+            debug("speak refused; releasing engine")
+            if (tts === engine) releaseTts()
             return
         }
-        runCatching { engine.speak(text, TextToSpeech.QUEUE_ADD, null, utteranceId) }
+        speakingKey = key
+        try {
+            val finished = withTimeoutOrNull(UTTERANCE_BASE_MS + text.length * UTTERANCE_PER_CHAR_MS) {
+                done.await()
+            }
+            if (finished == null) {
+                debug("utterance timed out; releasing engine")
+                if (tts === engine) releaseTts()
+            }
+        } finally {
+            utteranceDone.remove(id)
+            speakingKey = null
+        }
     }
 
     /** Stop and release the engine; a fresh trip re-reads new arrivals. */
     private fun disarm() {
-        pending.clear()
         clearSpeechQueue()
         spokenHashes.clear()
-        ttsReady = false
+        releaseTts()
+    }
+
+    private fun releaseTts() {
         tts?.let {
             runCatching { it.stop() }
             runCatching { it.shutdown() }
         }
         tts = null
+        ttsInit = null
+        utteranceDone.values.forEach { it.complete(Unit) }
+        utteranceDone.clear()
     }
 
     private fun clearSpeechQueue() {
         speechQueue.clear()
+        runCatching { tts?.stop() }
         speechJob?.cancel()
         speechJob = null
     }
@@ -618,6 +724,12 @@ class MediaNotificationListener : NotificationListenerService() {
         private const val SOUND_POLL_MS = 100L
         private const val SOUND_PREEXISTING_MS = 5_000L
         private const val SOUND_TAIL_MS = 300L
+
+        // Bounds on waiting for the speech engine: initialization, and one
+        // utterance (generous: ~15 chars/s is typical, this allows ~0.2x rate).
+        private const val TTS_INIT_TIMEOUT_MS = 10_000L
+        private const val UTTERANCE_BASE_MS = 15_000L
+        private const val UTTERANCE_PER_CHAR_MS = 300L
 
         private val DISCONNECT_WORDS =
             Regex("disconnect|stop|turn off|pause|quit", RegexOption.IGNORE_CASE)
