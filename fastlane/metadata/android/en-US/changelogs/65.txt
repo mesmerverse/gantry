@@ -1,0 +1,3 @@
+- Read-aloud skips a notification that was removed before its turn, and speaks only the latest text of one that was updated.
+- Switching read-aloud to Messages only also applies to notifications already waiting.
+- A private notification waiting to be spoken is redacted if the phone locks (or the screen turns off) before its turn.
